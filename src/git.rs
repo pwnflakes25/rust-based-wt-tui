@@ -91,7 +91,18 @@ impl GitContext {
             .ok_or_else(|| GitError::WorktreeNotFound(name.to_owned()).into())
     }
 
-    /// Create a new worktree.
+    /// Check if a local branch exists.
+    pub fn branch_exists(&self, branch: &str) -> bool {
+        run_git(
+            &["rev-parse", "--verify", branch],
+            Some(&self.repo_root),
+        )
+        .is_ok()
+    }
+
+    /// Create a new worktree. Auto-detects whether the branch already exists:
+    /// - Existing branch: checks it out into the worktree
+    /// - New branch: creates it from `base`
     pub fn create_worktree(&self, branch: &str, base: &str) -> Result<PathBuf> {
         // Ensure .worktrees dir exists
         std::fs::create_dir_all(&self.worktrees_dir)
@@ -116,17 +127,21 @@ impl GitContext {
             }
         }
 
-        run_git(
-            &[
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                worktree_path.to_str().unwrap_or_default(),
-                base,
-            ],
-            Some(&self.repo_root),
-        )?;
+        let path_str = worktree_path.to_str().unwrap_or_default();
+
+        if self.branch_exists(branch) {
+            // Branch exists — just check it out into the worktree
+            run_git(
+                &["worktree", "add", path_str, branch],
+                Some(&self.repo_root),
+            )?;
+        } else {
+            // New branch — create from base
+            run_git(
+                &["worktree", "add", "-b", branch, path_str, base],
+                Some(&self.repo_root),
+            )?;
+        }
 
         Ok(worktree_path)
     }

@@ -7,6 +7,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     match &app.mode {
         AppMode::Normal => handle_normal(app, key),
         AppMode::ConfirmDelete => handle_confirm_delete(app, key),
+        AppMode::ConfirmForceDelete => handle_confirm_force_delete(app, key),
+        AppMode::NewInput(_) => handle_new_input(app, key),
         AppMode::PrInput(_) => handle_pr_input(app, key),
     }
 }
@@ -32,10 +34,8 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('n') => {
-            // New worktree: we can't easily prompt in TUI, so show a message
-            app.message = Some(
-                "Use 'wt new <branch>' from the command line to create a worktree.".to_owned(),
-            );
+            app.mode = AppMode::NewInput(String::new());
+            app.message = None;
         }
         KeyCode::Char('d') => {
             if let Some(wt) = app.selected_worktree() {
@@ -50,6 +50,23 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             if let Some(wt) = app.selected_worktree() {
                 app.switch_path = Some(wt.path.display().to_string());
                 app.should_quit = true;
+            }
+        }
+        KeyCode::Char('c') => {
+            // Open selected worktree in Cursor
+            if let Some(wt) = app.selected_worktree() {
+                let path = wt.path.display().to_string();
+                match std::process::Command::new("cursor")
+                    .arg(&path)
+                    .spawn()
+                {
+                    Ok(_) => {
+                        app.message = Some(format!("Opened Cursor at {path}"));
+                    }
+                    Err(e) => {
+                        app.message = Some(format!("Failed to open Cursor: {e}"));
+                    }
+                }
             }
         }
         KeyCode::Char('e') => {
@@ -103,6 +120,36 @@ fn handle_confirm_delete(app: &mut App, key: KeyEvent) {
                 Ok(()) => {
                     app.message = Some(format!("Removed '{name}'."));
                     let _ = app.refresh();
+                    app.mode = AppMode::Normal;
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("modified or untracked") || err_str.contains("--force") {
+                        app.message = Some(format!("'{name}' has local changes. Force delete?"));
+                        app.mode = AppMode::ConfirmForceDelete;
+                    } else {
+                        app.message = Some(format!("Error: {e}"));
+                        app.mode = AppMode::Normal;
+                    }
+                }
+            }
+        } else {
+            app.mode = AppMode::Normal;
+        }
+    } else {
+        app.mode = AppMode::Normal;
+        app.message = None;
+    }
+}
+
+fn handle_confirm_force_delete(app: &mut App, key: KeyEvent) {
+    if let KeyCode::Char('y' | 'Y') = key.code {
+        if let Some(wt) = app.selected_worktree().cloned() {
+            let name = wt.display_name();
+            match app.ctx.remove_worktree(&name, true) {
+                Ok(()) => {
+                    app.message = Some(format!("Force removed '{name}'."));
+                    let _ = app.refresh();
                 }
                 Err(e) => {
                     app.message = Some(format!("Error: {e}"));
@@ -113,6 +160,62 @@ fn handle_confirm_delete(app: &mut App, key: KeyEvent) {
     } else {
         app.mode = AppMode::Normal;
         app.message = None;
+    }
+}
+
+fn handle_new_input(app: &mut App, key: KeyEvent) {
+    let current_input = if let AppMode::NewInput(s) = &app.mode {
+        s.clone()
+    } else {
+        return;
+    };
+
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = AppMode::Normal;
+            app.message = None;
+        }
+        KeyCode::Enter => {
+            let branch = current_input.trim().to_owned();
+            if branch.is_empty() {
+                app.message = Some("Branch name cannot be empty.".to_owned());
+                app.mode = AppMode::Normal;
+                return;
+            }
+            app.mode = AppMode::Normal;
+
+            let base = app.ctx.detect_default_branch();
+            match app.ctx.create_worktree(&branch, &base) {
+                Ok(path) => {
+                    // Auto-copy env files
+                    if app.config.auto_copy_env {
+                        if let Some(current) = &app.current_path {
+                            let _ = crate::env::copy_env_files(
+                                current,
+                                &path,
+                                &app.config.env_patterns,
+                            );
+                        }
+                    }
+                    app.message = Some(format!("Created worktree '{branch}'."));
+                    let _ = app.refresh();
+                }
+                Err(e) => {
+                    app.message = Some(format!("Error: {e}"));
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            let mut s = current_input;
+            s.pop();
+            app.mode = AppMode::NewInput(s);
+        }
+        KeyCode::Char(c) => {
+            let mut s = current_input;
+            s.push(c);
+            app.mode = AppMode::NewInput(s);
+        }
+        _ => {}
     }
 }
 

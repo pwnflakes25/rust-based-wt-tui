@@ -23,7 +23,11 @@ pub fn run(
         }
     };
 
-    eprintln!("Creating worktree for branch '{branch}' from '{base_branch}'...");
+    if ctx.branch_exists(branch) {
+        eprintln!("Branch '{branch}' exists, creating worktree from it...");
+    } else {
+        eprintln!("Creating worktree for new branch '{branch}' from '{base_branch}'...");
+    }
 
     let worktree_path = ctx.create_worktree(branch, &base_branch)?;
 

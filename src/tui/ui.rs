@@ -27,10 +27,9 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let mode_str = match &app.mode {
         AppMode::Normal => "",
         AppMode::ConfirmDelete => " [CONFIRM DELETE]",
-        AppMode::PrInput(s) => {
-            let _ = s;
-            " [PR INPUT]"
-        }
+        AppMode::ConfirmForceDelete => " [FORCE DELETE]",
+        AppMode::NewInput(_) => " [NEW WORKTREE]",
+        AppMode::PrInput(_) => " [PR INPUT]",
     };
 
     let title = Line::from(vec![
@@ -201,6 +200,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 Span::raw("ew "),
                 Span::styled("[d]", Style::default().fg(Color::Cyan)),
                 Span::raw("el "),
+                Span::styled("[c]", Style::default().fg(Color::Cyan)),
+                Span::raw("ursor "),
                 Span::styled("[e]", Style::default().fg(Color::Cyan)),
                 Span::raw("nv "),
                 Span::styled("[s]", Style::default().fg(Color::Cyan)),
@@ -223,6 +224,21 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 Span::raw("es "),
                 Span::styled("[n]", Style::default().fg(Color::Cyan)),
                 Span::raw("o"),
+            ]),
+            AppMode::ConfirmForceDelete => Line::from(vec![
+                Span::styled(
+                    " Has local changes. Force delete? ",
+                    Style::default().fg(Color::Red),
+                ),
+                Span::styled("[y]", Style::default().fg(Color::Cyan)),
+                Span::raw("es "),
+                Span::styled("[n]", Style::default().fg(Color::Cyan)),
+                Span::raw("o"),
+            ]),
+            AppMode::NewInput(s) => Line::from(vec![
+                Span::raw(" Branch: "),
+                Span::styled(s.as_str(), Style::default().fg(Color::Cyan)),
+                Span::raw("_ (Enter to create, Esc to cancel)"),
             ]),
             AppMode::PrInput(s) => Line::from(vec![
                 Span::raw(" PR #: "),

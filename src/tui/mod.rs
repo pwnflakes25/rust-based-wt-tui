@@ -20,6 +20,8 @@ use crate::git::GitContext;
 pub enum AppMode {
     Normal,
     ConfirmDelete,
+    ConfirmForceDelete,
+    NewInput(String),
     PrInput(String),
 }
 
