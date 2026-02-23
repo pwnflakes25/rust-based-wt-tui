@@ -28,7 +28,7 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         AppMode::Normal => "",
         AppMode::ConfirmDelete => " [CONFIRM DELETE]",
         AppMode::ConfirmForceDelete => " [FORCE DELETE]",
-        AppMode::NewInput(_) => " [NEW WORKTREE]",
+        AppMode::NewInput(_) | AppMode::NewBaseInput { .. } => " [NEW WORKTREE]",
         AppMode::PrInput(_) => " [PR INPUT]",
     };
 
@@ -238,6 +238,11 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
             AppMode::NewInput(s) => Line::from(vec![
                 Span::raw(" Branch: "),
                 Span::styled(s.as_str(), Style::default().fg(Color::Cyan)),
+                Span::raw("_ (Enter to confirm, Esc to cancel)"),
+            ]),
+            AppMode::NewBaseInput { base, .. } => Line::from(vec![
+                Span::raw(" Base branch: "),
+                Span::styled(base.as_str(), Style::default().fg(Color::Cyan)),
                 Span::raw("_ (Enter to create, Esc to cancel)"),
             ]),
             AppMode::PrInput(s) => Line::from(vec![

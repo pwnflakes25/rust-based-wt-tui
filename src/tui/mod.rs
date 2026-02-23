@@ -22,6 +22,8 @@ pub enum AppMode {
     ConfirmDelete,
     ConfirmForceDelete,
     NewInput(String),
+    /// Second step: user has entered a new branch name, now picking the base branch.
+    NewBaseInput { branch: String, base: String },
     PrInput(String),
 }
 

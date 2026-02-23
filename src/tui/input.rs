@@ -9,6 +9,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         AppMode::ConfirmDelete => handle_confirm_delete(app, key),
         AppMode::ConfirmForceDelete => handle_confirm_force_delete(app, key),
         AppMode::NewInput(_) => handle_new_input(app, key),
+        AppMode::NewBaseInput { .. } => handle_new_base_input(app, key),
         AppMode::PrInput(_) => handle_pr_input(app, key),
     }
 }
@@ -182,27 +183,17 @@ fn handle_new_input(app: &mut App, key: KeyEvent) {
                 app.mode = AppMode::Normal;
                 return;
             }
-            app.mode = AppMode::Normal;
 
-            let base = app.ctx.detect_default_branch();
-            match app.ctx.create_worktree(&branch, &base) {
-                Ok(path) => {
-                    // Auto-copy env files
-                    if app.config.auto_copy_env {
-                        if let Some(current) = &app.current_path {
-                            let _ = crate::env::copy_env_files(
-                                current,
-                                &path,
-                                &app.config.env_patterns,
-                            );
-                        }
-                    }
-                    app.message = Some(format!("Created worktree '{branch}'."));
-                    let _ = app.refresh();
-                }
-                Err(e) => {
-                    app.message = Some(format!("Error: {e}"));
-                }
+            if app.ctx.branch_exists(&branch) {
+                // Branch exists — base is irrelevant, create immediately
+                create_worktree(app, &branch, "");
+            } else {
+                // New branch — ask for base
+                let default_base = app.ctx.detect_default_branch();
+                app.mode = AppMode::NewBaseInput {
+                    branch,
+                    base: default_base,
+                };
             }
         }
         KeyCode::Backspace => {
@@ -216,6 +207,61 @@ fn handle_new_input(app: &mut App, key: KeyEvent) {
             app.mode = AppMode::NewInput(s);
         }
         _ => {}
+    }
+}
+
+fn handle_new_base_input(app: &mut App, key: KeyEvent) {
+    let (branch, current_base) = if let AppMode::NewBaseInput { branch, base } = &app.mode {
+        (branch.clone(), base.clone())
+    } else {
+        return;
+    };
+
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = AppMode::Normal;
+            app.message = None;
+        }
+        KeyCode::Enter => {
+            let base = current_base.trim().to_owned();
+            if base.is_empty() {
+                app.message = Some("Base branch cannot be empty.".to_owned());
+                app.mode = AppMode::Normal;
+                return;
+            }
+            create_worktree(app, &branch, &base);
+        }
+        KeyCode::Backspace => {
+            let mut s = current_base;
+            s.pop();
+            app.mode = AppMode::NewBaseInput { branch, base: s };
+        }
+        KeyCode::Char(c) => {
+            let mut s = current_base;
+            s.push(c);
+            app.mode = AppMode::NewBaseInput { branch, base: s };
+        }
+        _ => {}
+    }
+}
+
+/// Shared helper to create a worktree and handle auto-copy env.
+fn create_worktree(app: &mut App, branch: &str, base: &str) {
+    app.mode = AppMode::Normal;
+    match app.ctx.create_worktree(branch, base) {
+        Ok(path) => {
+            if app.config.auto_copy_env {
+                if let Some(current) = &app.current_path {
+                    let _ =
+                        crate::env::copy_env_files(current, &path, &app.config.env_patterns);
+                }
+            }
+            app.message = Some(format!("Created worktree '{branch}'."));
+            let _ = app.refresh();
+        }
+        Err(e) => {
+            app.message = Some(format!("Error: {e}"));
+        }
     }
 }
 
