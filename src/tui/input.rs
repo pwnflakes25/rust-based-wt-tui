@@ -1,13 +1,12 @@
 use crossterm::event::{KeyCode, KeyEvent};
 
-use super::{App, AppMode};
-use crate::env::copy_env_files;
+use super::{App, AppMode, Autocomplete};
+use crate::env::{copy_env_files, copy_path_entries};
 
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     match &app.mode {
         AppMode::Normal => handle_normal(app, key),
         AppMode::ConfirmDelete => handle_confirm_delete(app, key),
-        AppMode::ConfirmForceDelete => handle_confirm_force_delete(app, key),
         AppMode::NewInput(_) => handle_new_input(app, key),
         AppMode::NewBaseInput { .. } => handle_new_base_input(app, key),
         AppMode::PrInput(_) => handle_pr_input(app, key),
@@ -16,7 +15,14 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 
 fn handle_normal(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => {
+        KeyCode::Esc => {
+            if app.message.is_some() {
+                app.message = None;
+            } else {
+                app.should_quit = true;
+            }
+        }
+        KeyCode::Char('q') => {
             app.should_quit = true;
         }
         KeyCode::Char('j') | KeyCode::Down => {
@@ -35,6 +41,8 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('n') => {
+            let branches = app.ctx.list_local_branches();
+            app.autocomplete = Some(Autocomplete::new(branches));
             app.mode = AppMode::NewInput(String::new());
             app.message = None;
         }
@@ -42,6 +50,8 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             if let Some(wt) = app.selected_worktree() {
                 if wt.is_main {
                     app.message = Some("Cannot delete the main worktree.".to_owned());
+                } else if app.deleting_paths.contains(&wt.path) {
+                    app.message = Some("Deletion already in progress.".to_owned());
                 } else {
                     app.mode = AppMode::ConfirmDelete;
                 }
@@ -70,32 +80,7 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
                 }
             }
         }
-        KeyCode::Char('e') => {
-            // Copy env from selected to current
-            if let Some(wt) = app.selected_worktree() {
-                if let Some(current) = &app.current_path {
-                    if &wt.path == current {
-                        app.message = Some("Cannot copy env to the same worktree.".to_owned());
-                    } else {
-                        match copy_env_files(&wt.path, current, &app.config.env_patterns) {
-                            Ok(copied) if copied.is_empty() => {
-                                app.message = Some("No .env files found to copy.".to_owned());
-                            }
-                            Ok(copied) => {
-                                app.message = Some(format!(
-                                    "Copied {} env file(s): {}",
-                                    copied.len(),
-                                    copied.join(", ")
-                                ));
-                            }
-                            Err(e) => {
-                                app.message = Some(format!("Error: {e}"));
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        KeyCode::Char('e') => handle_copy(app),
         KeyCode::Char('p') => {
             app.mode = AppMode::PrInput(String::new());
         }
@@ -113,55 +98,72 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn handle_confirm_delete(app: &mut App, key: KeyEvent) {
-    if let KeyCode::Char('y' | 'Y') = key.code {
-        if let Some(wt) = app.selected_worktree().cloned() {
-            let name = wt.display_name();
-            match app.ctx.remove_worktree(&name, false) {
-                Ok(()) => {
-                    app.message = Some(format!("Removed '{name}'."));
-                    let _ = app.refresh();
-                    app.mode = AppMode::Normal;
-                }
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if err_str.contains("modified or untracked") || err_str.contains("--force") {
-                        app.message = Some(format!("'{name}' has local changes. Force delete?"));
-                        app.mode = AppMode::ConfirmForceDelete;
-                    } else {
-                        app.message = Some(format!("Error: {e}"));
-                        app.mode = AppMode::Normal;
-                    }
-                }
+/// Copy env files and extra paths from selected worktree to current.
+fn handle_copy(app: &mut App) {
+    let Some(wt) = app.selected_worktree() else {
+        return;
+    };
+    let Some(current) = &app.current_path else {
+        return;
+    };
+
+    if &wt.path == current {
+        app.message = Some("Cannot copy to the same worktree.".to_owned());
+        return;
+    }
+
+    let source = wt.path.clone();
+    match copy_env_files(&source, current, &app.config.env_patterns) {
+        Ok(copied) => {
+            let extra =
+                copy_path_entries(&source, current, &app.config.copy_paths).unwrap_or_default();
+            let total = copied.len() + extra.len();
+            if total == 0 {
+                app.message = Some("No files found to copy.".to_owned());
+            } else {
+                let mut all: Vec<String> = copied;
+                all.extend(extra);
+                app.message = Some(format!("Copied {} item(s): {}", total, all.join(", ")));
             }
-        } else {
-            app.mode = AppMode::Normal;
         }
-    } else {
-        app.mode = AppMode::Normal;
-        app.message = None;
+        Err(e) => {
+            app.message = Some(format!("Error: {e}"));
+        }
     }
 }
 
-fn handle_confirm_force_delete(app: &mut App, key: KeyEvent) {
-    if let KeyCode::Char('y' | 'Y') = key.code {
-        if let Some(wt) = app.selected_worktree().cloned() {
-            let name = wt.display_name();
-            match app.ctx.remove_worktree(&name, true) {
-                Ok(()) => {
-                    app.message = Some(format!("Force removed '{name}'."));
-                    let _ = app.refresh();
-                }
-                Err(e) => {
-                    app.message = Some(format!("Error: {e}"));
-                }
-            }
-        }
-        app.mode = AppMode::Normal;
-    } else {
+fn handle_confirm_delete(app: &mut App, key: KeyEvent) {
+    if !matches!(key.code, KeyCode::Char('y' | 'Y')) {
         app.mode = AppMode::Normal;
         app.message = None;
+        return;
     }
+
+    let Some(wt) = app.selected_worktree().cloned() else {
+        app.mode = AppMode::Normal;
+        return;
+    };
+
+    app.mode = AppMode::Normal;
+
+    let path = wt.path.clone();
+    let name = wt.display_name();
+    app.deleting_paths.insert(path.clone());
+
+    let ctx = app.ctx.clone();
+    let tx = app.delete_tx.clone();
+
+    std::thread::spawn(move || {
+        let result = ctx.remove_worktree_at(&wt, false).or_else(|e| {
+            let err_str = e.to_string();
+            if err_str.contains("modified or untracked") || err_str.contains("--force") {
+                ctx.remove_worktree_at(&wt, true)
+            } else {
+                Err(e)
+            }
+        });
+        let _ = tx.send((path, name, result));
+    });
 }
 
 fn handle_new_input(app: &mut App, key: KeyEvent) {
@@ -174,6 +176,7 @@ fn handle_new_input(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
             app.mode = AppMode::Normal;
+            app.autocomplete = None;
             app.message = None;
         }
         KeyCode::Enter => {
@@ -181,8 +184,11 @@ fn handle_new_input(app: &mut App, key: KeyEvent) {
             if branch.is_empty() {
                 app.message = Some("Branch name cannot be empty.".to_owned());
                 app.mode = AppMode::Normal;
+                app.autocomplete = None;
                 return;
             }
+
+            app.autocomplete = None;
 
             if app.ctx.branch_exists(&branch) {
                 // Branch exists — base is irrelevant, create immediately
@@ -190,20 +196,51 @@ fn handle_new_input(app: &mut App, key: KeyEvent) {
             } else {
                 // New branch — ask for base
                 let default_base = app.ctx.detect_default_branch();
+                let branches = app.ctx.list_all_branches();
+                let mut ac = Autocomplete::new(branches);
+                ac.update_filter(&default_base);
+                app.autocomplete = Some(ac);
                 app.mode = AppMode::NewBaseInput {
                     branch,
                     base: default_base,
                 };
             }
         }
+        KeyCode::Tab => {
+            if let Some(ac) = &app.autocomplete {
+                if let Some(val) = ac.selected_value() {
+                    let val = val.to_owned();
+                    app.mode = AppMode::NewInput(val.clone());
+                    if let Some(ac) = &mut app.autocomplete {
+                        ac.update_filter(&val);
+                    }
+                }
+            }
+        }
+        KeyCode::Down => {
+            if let Some(ac) = &mut app.autocomplete {
+                ac.next();
+            }
+        }
+        KeyCode::Up => {
+            if let Some(ac) = &mut app.autocomplete {
+                ac.prev();
+            }
+        }
         KeyCode::Backspace => {
             let mut s = current_input;
             s.pop();
+            if let Some(ac) = &mut app.autocomplete {
+                ac.update_filter(&s);
+            }
             app.mode = AppMode::NewInput(s);
         }
         KeyCode::Char(c) => {
             let mut s = current_input;
             s.push(c);
+            if let Some(ac) = &mut app.autocomplete {
+                ac.update_filter(&s);
+            }
             app.mode = AppMode::NewInput(s);
         }
         _ => {}
@@ -220,6 +257,7 @@ fn handle_new_base_input(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
             app.mode = AppMode::Normal;
+            app.autocomplete = None;
             app.message = None;
         }
         KeyCode::Enter => {
@@ -227,18 +265,50 @@ fn handle_new_base_input(app: &mut App, key: KeyEvent) {
             if base.is_empty() {
                 app.message = Some("Base branch cannot be empty.".to_owned());
                 app.mode = AppMode::Normal;
+                app.autocomplete = None;
                 return;
             }
+            app.autocomplete = None;
             create_worktree(app, &branch, &base);
+        }
+        KeyCode::Tab => {
+            if let Some(ac) = &app.autocomplete {
+                if let Some(val) = ac.selected_value() {
+                    let val = val.to_owned();
+                    app.mode = AppMode::NewBaseInput {
+                        branch,
+                        base: val.clone(),
+                    };
+                    if let Some(ac) = &mut app.autocomplete {
+                        ac.update_filter(&val);
+                    }
+                }
+            }
+        }
+        KeyCode::Down => {
+            if let Some(ac) = &mut app.autocomplete {
+                ac.next();
+            }
+        }
+        KeyCode::Up => {
+            if let Some(ac) = &mut app.autocomplete {
+                ac.prev();
+            }
         }
         KeyCode::Backspace => {
             let mut s = current_base;
             s.pop();
+            if let Some(ac) = &mut app.autocomplete {
+                ac.update_filter(&s);
+            }
             app.mode = AppMode::NewBaseInput { branch, base: s };
         }
         KeyCode::Char(c) => {
             let mut s = current_base;
             s.push(c);
+            if let Some(ac) = &mut app.autocomplete {
+                ac.update_filter(&s);
+            }
             app.mode = AppMode::NewBaseInput { branch, base: s };
         }
         _ => {}
@@ -254,10 +324,12 @@ fn create_worktree(app: &mut App, branch: &str, base: &str) {
                 if let Some(current) = &app.current_path {
                     let _ =
                         crate::env::copy_env_files(current, &path, &app.config.env_patterns);
+                    let _ =
+                        crate::env::copy_path_entries(current, &path, &app.config.copy_paths);
                 }
             }
             app.message = Some(format!("Created worktree '{branch}'."));
-            let _ = app.refresh();
+            let _ = app.refresh_ex(false);
         }
         Err(e) => {
             app.message = Some(format!("Error: {e}"));
@@ -283,7 +355,7 @@ fn handle_pr_input(app: &mut App, key: KeyEvent) {
                 match crate::commands::pr::run(&app.ctx, &app.config, num) {
                     Ok(()) => {
                         app.message = Some(format!("PR #{num} worktree created."));
-                        let _ = app.refresh();
+                        let _ = app.refresh_ex(false);
                     }
                     Err(e) => {
                         app.message = Some(format!("PR error: {e}"));
