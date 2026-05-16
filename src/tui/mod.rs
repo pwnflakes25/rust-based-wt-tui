@@ -226,6 +226,24 @@ pub fn run_dashboard(ctx: GitContext, config: Config) -> Result<Option<String>> 
                 }
             }
         }
+
+        // Drain completed deletion results from background threads
+        loop {
+            match app.delete_rx.try_recv() {
+                Ok((path, name, Ok(()))) => {
+                    app.deleting_paths.remove(&path);
+                    app.message = Some(format!("Removed '{name}'."));
+                    let _ = app.refresh_ex(false);
+                }
+                Ok((path, _, Err(e))) => {
+                    app.deleting_paths.remove(&path);
+                    app.message = Some(format!("Error: {e}"));
+                }
+                Err(_) => break,
+            }
+        }
+
+        app.spinner_frame = app.spinner_frame.wrapping_add(1);
     }
 
     // Restore terminal
