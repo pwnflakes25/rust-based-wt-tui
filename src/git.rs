@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
+use git2::Repository;
 
 #[derive(Debug, thiserror::Error)]
 #[allow(dead_code)]
@@ -45,7 +46,7 @@ impl Worktree {
 }
 
 /// Context for all git operations, anchored to a repo root.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GitContext {
     pub repo_root: PathBuf,
     pub worktrees_dir: PathBuf,
@@ -65,9 +66,11 @@ impl GitContext {
     }
 
     /// List all worktrees via `git worktree list --porcelain`.
-    pub fn list_worktrees(&self) -> Result<Vec<Worktree>> {
-        // Prune stale worktrees first
-        let _ = run_git(&["worktree", "prune"], Some(&self.repo_root));
+    /// When `prune` is true, runs `git worktree prune` first to clean stale entries.
+    pub fn list_worktrees_ex(&self, prune: bool) -> Result<Vec<Worktree>> {
+        if prune {
+            let _ = run_git(&["worktree", "prune"], Some(&self.repo_root));
+        }
 
         let output = run_git(
             &["worktree", "list", "--porcelain"],
@@ -76,9 +79,14 @@ impl GitContext {
         Ok(parse_porcelain(&output, &self.repo_root))
     }
 
+    /// List all worktrees (with prune). Convenience wrapper for backward compat.
+    pub fn list_worktrees(&self) -> Result<Vec<Worktree>> {
+        self.list_worktrees_ex(true)
+    }
+
     /// Find a worktree by branch name or directory name.
     pub fn find_worktree(&self, name: &str) -> Result<Worktree> {
-        let worktrees = self.list_worktrees()?;
+        let worktrees = self.list_worktrees_ex(false)?;
         worktrees
             .into_iter()
             .find(|wt| {
@@ -146,19 +154,23 @@ impl GitContext {
         Ok(worktree_path)
     }
 
-    /// Remove a worktree.
+    /// Remove a worktree by name (looks it up first).
     pub fn remove_worktree(&self, name: &str, force: bool) -> Result<()> {
         let wt = self.find_worktree(name)?;
+        self.remove_worktree_at(&wt, force)
+    }
 
+    /// Remove a worktree by reference, skipping the name-based lookup.
+    pub fn remove_worktree_at(&self, wt: &Worktree, force: bool) -> Result<()> {
         if wt.is_main {
             anyhow::bail!("Cannot remove the main worktree");
         }
 
+        let path_str = wt.path.to_string_lossy();
         let mut args = vec!["worktree", "remove"];
         if force {
             args.push("--force");
         }
-        let path_str = wt.path.to_string_lossy().to_string();
         args.push(&path_str);
 
         run_git(&args, Some(&self.repo_root))?;
@@ -171,14 +183,19 @@ impl GitContext {
         Ok(())
     }
 
-    /// Check if a worktree has uncommitted changes.
+    /// Check if a worktree has uncommitted changes using libgit2.
     #[allow(clippy::unused_self)]
     pub fn is_worktree_dirty(&self, path: &Path) -> Result<bool> {
-        let output = run_git(
-            &["status", "--porcelain"],
-            Some(path),
-        )?;
-        Ok(!output.trim().is_empty())
+        let repo = Repository::open(path)
+            .context("Failed to open repository")?;
+
+        let mut opts = git2::StatusOptions::new();
+        opts.include_untracked(true)
+            .recurse_untracked_dirs(false)
+            .exclude_submodules(true);
+
+        let statuses = repo.statuses(Some(&mut opts))?;
+        Ok(!statuses.is_empty())
     }
 
     /// Get the current branch name.
@@ -200,35 +217,78 @@ impl GitContext {
         Ok(PathBuf::from(output.trim()))
     }
 
-    /// Get ahead/behind counts relative to upstream.
+    /// Get ahead/behind counts relative to upstream using libgit2.
+    /// If `branch_name` is provided, skips detecting the branch from HEAD.
     #[allow(clippy::unused_self)]
-    pub fn ahead_behind(&self, path: &Path) -> Result<(u32, u32)> {
-        let branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"], Some(path))?;
-        let branch = branch.trim();
+    pub fn ahead_behind(&self, path: &Path, branch_name: Option<&str>) -> (u32, u32) {
+        let Ok(repo) = Repository::open(path) else {
+            return (0, 0);
+        };
 
-        let upstream = format!("origin/{branch}");
-        let result = run_git(
-            &[
-                "rev-list",
-                "--left-right",
-                "--count",
-                &format!("{branch}...{upstream}"),
-            ],
-            Some(path),
-        );
-
-        match result {
-            Ok(output) => {
-                let parts: Vec<&str> = output.trim().split('\t').collect();
-                if parts.len() == 2 {
-                    let ahead = parts[0].parse().unwrap_or(0);
-                    let behind = parts[1].parse().unwrap_or(0);
-                    Ok((ahead, behind))
-                } else {
-                    Ok((0, 0))
-                }
+        let branch = if let Some(name) = branch_name {
+            name.to_owned()
+        } else {
+            match repo.head() {
+                Ok(head) => head.shorthand().unwrap_or("HEAD").to_owned(),
+                Err(_) => return (0, 0),
             }
-            Err(_) => Ok((0, 0)), // No upstream tracking
+        };
+
+        let local_ref = format!("refs/heads/{branch}");
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+
+        let Ok(local_oid) = repo.refname_to_id(&local_ref) else {
+            return (0, 0);
+        };
+        let Ok(remote_oid) = repo.refname_to_id(&remote_ref) else {
+            return (0, 0);
+        };
+
+        repo.graph_ahead_behind(local_oid, remote_oid)
+            .map(|(a, b)| (u32::try_from(a).unwrap_or(0), u32::try_from(b).unwrap_or(0)))
+            .unwrap_or((0, 0))
+    }
+
+    /// List local branch names (sorted).
+    pub fn list_local_branches(&self) -> Vec<String> {
+        let output = run_git(
+            &["branch", "--format=%(refname:short)"],
+            Some(&self.repo_root),
+        );
+        match output {
+            Ok(s) => {
+                let mut branches: Vec<String> = s
+                    .lines()
+                    .map(|l| l.trim().to_owned())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                branches.sort();
+                branches
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// List all branches (local + remote), stripping `origin/` prefix, deduplicated and sorted.
+    pub fn list_all_branches(&self) -> Vec<String> {
+        let output = run_git(
+            &["branch", "-a", "--format=%(refname:short)"],
+            Some(&self.repo_root),
+        );
+        match output {
+            Ok(s) => {
+                let mut seen = std::collections::BTreeSet::new();
+                for line in s.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.contains("HEAD") {
+                        continue;
+                    }
+                    let name = trimmed.strip_prefix("origin/").unwrap_or(trimmed);
+                    seen.insert(name.to_owned());
+                }
+                seen.into_iter().collect()
+            }
+            Err(_) => Vec::new(),
         }
     }
 
