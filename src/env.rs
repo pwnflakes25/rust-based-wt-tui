@@ -110,9 +110,83 @@ pub fn copy_env_files(
     Ok(copied)
 }
 
+/// Copy root-relative paths (files or directories) from source to target worktree.
+/// Returns the list of paths that were successfully copied.
+pub fn copy_path_entries(
+    source_dir: &Path,
+    target_dir: &Path,
+    paths: &[String],
+) -> Result<Vec<String>> {
+    let mut copied = Vec::new();
+
+    for rel_path in paths {
+        let src = source_dir.join(rel_path);
+        if !src.exists() {
+            continue;
+        }
+
+        let dst = target_dir.join(rel_path);
+
+        if src.is_dir() {
+            copy_dir_recursive(&src, &dst)
+                .with_context(|| format!("Failed to copy directory {rel_path}"))?;
+        } else {
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("Failed to create directory for {rel_path}"))?;
+            }
+            std::fs::copy(&src, &dst)
+                .with_context(|| format!("Failed to copy {rel_path}"))?;
+        }
+        copied.push(rel_path.clone());
+    }
+
+    Ok(copied)
+}
+
+/// Recursively copy a directory and all its contents.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// Recursively collect all file and directory paths under `root`.
+    fn walkdir(root: &Path) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        walkdir_recursive(root, &mut paths);
+        paths
+    }
+
+    fn walkdir_recursive(dir: &Path, paths: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            paths.push(path.clone());
+            if path.is_dir() {
+                walkdir_recursive(&path, paths);
+            }
+        }
+    }
 
     #[test]
     fn find_env_files_in_empty_dir() {
@@ -212,5 +286,243 @@ mod tests {
         assert!(nested_path.exists());
         let nested_content = std::fs::read_to_string(nested_path).unwrap();
         assert_eq!(nested_content, "WEB=456");
+    }
+
+    #[test]
+    fn copy_path_entries_copies_directories() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        // Create .claude directory with nested files
+        let claude_dir = src.path().join(".claude");
+        std::fs::create_dir_all(claude_dir.join("sub")).unwrap();
+        std::fs::write(claude_dir.join("config.json"), r#"{"key":"val"}"#).unwrap();
+        std::fs::write(claude_dir.join("sub").join("data.txt"), "nested").unwrap();
+
+        let paths = vec![".claude".to_owned()];
+        let copied = copy_path_entries(src.path(), dst.path(), &paths).unwrap();
+
+        assert_eq!(copied, vec![".claude"]);
+        assert!(dst.path().join(".claude").join("config.json").exists());
+        assert!(dst.path().join(".claude").join("sub").join("data.txt").exists());
+
+        let content =
+            std::fs::read_to_string(dst.path().join(".claude").join("config.json")).unwrap();
+        assert_eq!(content, r#"{"key":"val"}"#);
+    }
+
+    #[test]
+    fn copy_path_entries_copies_individual_files() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        let vscode_dir = src.path().join(".vscode");
+        std::fs::create_dir_all(&vscode_dir).unwrap();
+        std::fs::write(vscode_dir.join("settings.json"), "{}").unwrap();
+
+        let paths = vec![".vscode/settings.json".to_owned()];
+        let copied = copy_path_entries(src.path(), dst.path(), &paths).unwrap();
+
+        assert_eq!(copied, vec![".vscode/settings.json"]);
+        assert!(dst.path().join(".vscode").join("settings.json").exists());
+    }
+
+    #[test]
+    fn copy_path_entries_merges_directories() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        // Source has .claude/settings.json and .claude/memory/a.md
+        let src_claude = src.path().join(".claude");
+        std::fs::create_dir_all(src_claude.join("memory")).unwrap();
+        std::fs::write(src_claude.join("settings.json"), r#"{"src":true}"#).unwrap();
+        std::fs::write(src_claude.join("memory").join("a.md"), "memory-a").unwrap();
+
+        // Destination already has .claude/CLAUDE.md and .claude/memory/b.md
+        let dst_claude = dst.path().join(".claude");
+        std::fs::create_dir_all(dst_claude.join("memory")).unwrap();
+        std::fs::write(dst_claude.join("CLAUDE.md"), "existing-claude").unwrap();
+        std::fs::write(dst_claude.join("memory").join("b.md"), "memory-b").unwrap();
+
+        let paths = vec![".claude".to_owned()];
+        copy_path_entries(src.path(), dst.path(), &paths).unwrap();
+
+        // Source files are copied
+        assert!(dst_claude.join("settings.json").exists());
+        assert!(dst_claude.join("memory").join("a.md").exists());
+
+        // Destination-only files are preserved (merge, not replace)
+        assert!(dst_claude.join("CLAUDE.md").exists());
+        assert!(dst_claude.join("memory").join("b.md").exists());
+
+        // Verify content integrity
+        assert_eq!(
+            std::fs::read_to_string(dst_claude.join("CLAUDE.md")).unwrap(),
+            "existing-claude"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst_claude.join("memory").join("a.md")).unwrap(),
+            "memory-a"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst_claude.join("memory").join("b.md")).unwrap(),
+            "memory-b"
+        );
+    }
+
+    #[test]
+    fn copy_path_entries_overwrites_shared_files() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        // Both have .claude/settings.json with different content
+        let src_claude = src.path().join(".claude");
+        std::fs::create_dir_all(&src_claude).unwrap();
+        std::fs::write(src_claude.join("settings.json"), "from-source").unwrap();
+
+        let dst_claude = dst.path().join(".claude");
+        std::fs::create_dir_all(&dst_claude).unwrap();
+        std::fs::write(dst_claude.join("settings.json"), "from-dest").unwrap();
+
+        let paths = vec![".claude".to_owned()];
+        copy_path_entries(src.path(), dst.path(), &paths).unwrap();
+
+        // Source wins for shared files
+        assert_eq!(
+            std::fs::read_to_string(dst_claude.join("settings.json")).unwrap(),
+            "from-source"
+        );
+    }
+
+    #[test]
+    fn copy_path_entries_merges_deeply_nested() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        // Source: .claude/a/b/c/deep.txt
+        let deep_src = src.path().join(".claude").join("a").join("b").join("c");
+        std::fs::create_dir_all(&deep_src).unwrap();
+        std::fs::write(deep_src.join("deep.txt"), "deep-source").unwrap();
+
+        // Dest: .claude/a/b/existing.txt and .claude/x/other.txt
+        let dst_ab = dst.path().join(".claude").join("a").join("b");
+        std::fs::create_dir_all(&dst_ab).unwrap();
+        std::fs::write(dst_ab.join("existing.txt"), "existing").unwrap();
+        let dst_x = dst.path().join(".claude").join("x");
+        std::fs::create_dir_all(&dst_x).unwrap();
+        std::fs::write(dst_x.join("other.txt"), "other").unwrap();
+
+        let paths = vec![".claude".to_owned()];
+        copy_path_entries(src.path(), dst.path(), &paths).unwrap();
+
+        // New deep file copied
+        assert!(dst.path().join(".claude/a/b/c/deep.txt").exists());
+        // Existing files preserved
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join(".claude/a/b/existing.txt")).unwrap(),
+            "existing"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join(".claude/x/other.txt")).unwrap(),
+            "other"
+        );
+    }
+
+    #[test]
+    fn copy_path_entries_no_nested_duplication() {
+        // Verify .claude doesn't end up as .claude/.claude
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        // Source: complex .claude structure
+        let src_claude = src.path().join(".claude");
+        std::fs::create_dir_all(src_claude.join("memory")).unwrap();
+        std::fs::create_dir_all(src_claude.join("projects").join("myproj")).unwrap();
+        std::fs::write(src_claude.join("settings.json"), "settings").unwrap();
+        std::fs::write(src_claude.join("CLAUDE.md"), "claude-md").unwrap();
+        std::fs::write(src_claude.join("memory").join("a.md"), "mem-a").unwrap();
+        std::fs::write(
+            src_claude.join("projects").join("myproj").join("MEMORY.md"),
+            "proj-mem",
+        )
+        .unwrap();
+
+        // Dest: already has .claude with some overlapping structure
+        let dst_claude = dst.path().join(".claude");
+        std::fs::create_dir_all(dst_claude.join("memory")).unwrap();
+        std::fs::write(dst_claude.join("memory").join("b.md"), "mem-b").unwrap();
+
+        let paths = vec![".claude".to_owned()];
+        copy_path_entries(src.path(), dst.path(), &paths).unwrap();
+
+        // CRITICAL: .claude/.claude must NOT exist — that would mean nesting bug
+        assert!(
+            !dst.path().join(".claude/.claude").exists(),
+            "BUG: .claude is nested inside .claude"
+        );
+
+        // Correct flat structure under .claude
+        assert!(dst_claude.join("settings.json").exists());
+        assert!(dst_claude.join("CLAUDE.md").exists());
+        assert!(dst_claude.join("memory/a.md").exists());
+        assert!(dst_claude.join("memory/b.md").exists()); // dest-only preserved
+        assert!(dst_claude.join("projects/myproj/MEMORY.md").exists());
+
+        // Double-check no nesting at any level
+        for entry in walkdir(dst.path()) {
+            let rel = entry.strip_prefix(dst.path()).unwrap();
+            let components: Vec<_> = rel.components().collect();
+            // Count how many times ".claude" appears in the path
+            let claude_count = components
+                .iter()
+                .filter(|c| c.as_os_str() == ".claude")
+                .count();
+            assert!(
+                claude_count <= 1,
+                "Nested .claude detected in path: {}",
+                rel.display()
+            );
+        }
+    }
+
+    #[test]
+    fn copy_path_entries_multiple_paths_merged() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        // Source has .claude and .vscode
+        let src_claude = src.path().join(".claude");
+        std::fs::create_dir_all(&src_claude).unwrap();
+        std::fs::write(src_claude.join("config.json"), "claude-cfg").unwrap();
+
+        let src_vscode = src.path().join(".vscode");
+        std::fs::create_dir_all(&src_vscode).unwrap();
+        std::fs::write(src_vscode.join("settings.json"), "vscode-cfg").unwrap();
+
+        // Dest already has .claude with different file
+        let dst_claude = dst.path().join(".claude");
+        std::fs::create_dir_all(&dst_claude).unwrap();
+        std::fs::write(dst_claude.join("local.json"), "local-only").unwrap();
+
+        let paths = vec![".claude".to_owned(), ".vscode".to_owned()];
+        let copied = copy_path_entries(src.path(), dst.path(), &paths).unwrap();
+
+        assert_eq!(copied.len(), 2);
+        // .claude merged
+        assert!(dst_claude.join("config.json").exists());
+        assert!(dst_claude.join("local.json").exists());
+        // .vscode copied
+        assert!(dst.path().join(".vscode/settings.json").exists());
+    }
+
+    #[test]
+    fn copy_path_entries_skips_missing() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        let paths = vec![".claude".to_owned(), ".nonexistent".to_owned()];
+        let copied = copy_path_entries(src.path(), dst.path(), &paths).unwrap();
+
+        assert!(copied.is_empty());
     }
 }

@@ -8,6 +8,9 @@ pub struct Config {
     pub env_patterns: Vec<String>,
     pub auto_copy_env: bool,
     pub default_base: String,
+    /// Root-relative paths (files or directories) to copy between worktrees
+    /// alongside env files, e.g. `.claude`, `.cursor`, `.vscode/settings.json`.
+    pub copy_paths: Vec<String>,
 }
 
 impl Default for Config {
@@ -20,6 +23,7 @@ impl Default for Config {
             ],
             auto_copy_env: true,
             default_base: "main".to_owned(),
+            copy_paths: vec![".claude".to_owned()],
         }
     }
 }
@@ -55,6 +59,7 @@ mod tests {
         assert_eq!(cfg.env_patterns.len(), 3);
         assert!(cfg.auto_copy_env);
         assert_eq!(cfg.default_base, "main");
+        assert_eq!(cfg.copy_paths, vec![".claude"]);
     }
 
     #[test]

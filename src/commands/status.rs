@@ -14,7 +14,7 @@ pub fn run(ctx: &GitContext, config: &Config) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Current directory is not a known worktree"))?;
 
     let dirty = ctx.is_worktree_dirty(&current.path)?;
-    let (ahead, behind) = ctx.ahead_behind(&current.path)?;
+    let (ahead, behind) = ctx.ahead_behind(&current.path, current.branch.as_deref());
 
     println!("Worktree:  {}", current.display_name());
     println!("Path:      {}", current.path.display());
