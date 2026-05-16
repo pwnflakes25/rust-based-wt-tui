@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::config::Config;
-use crate::env::{copy_env_files, find_env_files};
+use crate::env::{copy_env_files, copy_path_entries, find_env_files};
 use crate::git::GitContext;
 
 pub fn run(
@@ -18,7 +18,9 @@ pub fn run(
     };
 
     let available = find_env_files(&source_wt.path, &config.env_patterns)?;
-    if available.is_empty() {
+    let has_copy_paths = !config.copy_paths.is_empty();
+
+    if available.is_empty() && !has_copy_paths {
         eprintln!("No .env files found in '{source}'.");
         return Ok(());
     }
@@ -33,7 +35,14 @@ pub fn run(
     for file in &copied {
         eprintln!("  {file}");
     }
-    eprintln!("{} file(s) copied.", copied.len());
+
+    let extra = copy_path_entries(&source_wt.path, &target_path, &config.copy_paths)?;
+    for path in &extra {
+        eprintln!("  {path}");
+    }
+
+    let total = copied.len() + extra.len();
+    eprintln!("{total} item(s) copied.");
 
     Ok(())
 }

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 
 use crate::config::Config;
-use crate::env::copy_env_files;
+use crate::env::{copy_env_files, copy_path_entries};
 use crate::git::{run_gh, GitContext, GitError};
 
 pub fn run(ctx: &GitContext, config: &Config, number: u64) -> Result<()> {
@@ -55,12 +55,16 @@ pub fn run(ctx: &GitContext, config: &Config, number: u64) -> Result<()> {
 
     eprintln!("Worktree created at: {}", worktree_path.display());
 
-    // Copy env if auto
+    // Copy env and extra paths if auto
     if config.auto_copy_env {
         let current = GitContext::current_worktree_path()?;
         let copied = copy_env_files(&current, &worktree_path, &config.env_patterns)?;
         if !copied.is_empty() {
             eprintln!("Copied env files: {}", copied.join(", "));
+        }
+        let extra = copy_path_entries(&current, &worktree_path, &config.copy_paths)?;
+        if !extra.is_empty() {
+            eprintln!("Copied paths: {}", extra.join(", "));
         }
     }
 
