@@ -1,7 +1,10 @@
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
+use git2::Repository;
 
 #[derive(Debug, thiserror::Error)]
 #[allow(dead_code)]
@@ -29,6 +32,7 @@ pub struct Worktree {
     pub branch: Option<String>,
     pub is_bare: bool,
     pub is_main: bool,
+    pub created: Option<SystemTime>,
 }
 
 impl Worktree {
@@ -44,8 +48,130 @@ impl Worktree {
     }
 }
 
+/// Ordering applied to the worktree list before it is displayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortMode {
+    #[default]
+    DateDesc,
+    DateAsc,
+    NameAsc,
+    NameDesc,
+}
+
+impl SortMode {
+    /// Next mode in the dashboard's `o` cycle.
+    #[must_use]
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::DateDesc => Self::DateAsc,
+            Self::DateAsc => Self::NameAsc,
+            Self::NameAsc => Self::NameDesc,
+            Self::NameDesc => Self::DateDesc,
+        }
+    }
+
+    /// Flip the direction, keeping the key.
+    #[must_use]
+    pub fn reversed(self) -> Self {
+        match self {
+            Self::DateDesc => Self::DateAsc,
+            Self::DateAsc => Self::DateDesc,
+            Self::NameAsc => Self::NameDesc,
+            Self::NameDesc => Self::NameAsc,
+        }
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DateDesc => "date \u{2193}",
+            Self::DateAsc => "date \u{2191}",
+            Self::NameAsc => "name \u{2191}",
+            Self::NameDesc => "name \u{2193}",
+        }
+    }
+
+    /// Parse a config value such as `date-desc`.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "date-desc" => Some(Self::DateDesc),
+            "date-asc" => Some(Self::DateAsc),
+            "name-asc" => Some(Self::NameAsc),
+            "name-desc" => Some(Self::NameDesc),
+            _ => None,
+        }
+    }
+}
+
+/// Order worktrees for display: the main worktree is pinned first, then the
+/// chosen key. Worktrees with an unknown creation time sink to the bottom in
+/// both date directions, and equal keys fall back to name so the order stays
+/// stable across refreshes.
+pub fn sort_worktrees(worktrees: &mut [Worktree], mode: SortMode) {
+    worktrees.sort_by(|a, b| {
+        b.is_main
+            .cmp(&a.is_main)
+            .then_with(|| match mode {
+                SortMode::DateDesc => compare_created(a, b, true),
+                SortMode::DateAsc => compare_created(a, b, false),
+                SortMode::NameAsc => name_key(a).cmp(&name_key(b)),
+                SortMode::NameDesc => name_key(b).cmp(&name_key(a)),
+            })
+            .then_with(|| name_key(a).cmp(&name_key(b)))
+    });
+}
+
+fn name_key(wt: &Worktree) -> String {
+    wt.display_name().to_lowercase()
+}
+
+fn compare_created(a: &Worktree, b: &Worktree, newest_first: bool) -> Ordering {
+    match (a.created, b.created) {
+        (Some(x), Some(y)) => {
+            if newest_first {
+                y.cmp(&x)
+            } else {
+                x.cmp(&y)
+            }
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Compact relative age for display: `<1m`, `45m`, `2h`, `3d`, `6w`, `14mo`,
+/// `2y`, or `-` when the creation time is unknown.
+#[must_use]
+pub fn format_age(created: Option<SystemTime>) -> String {
+    let Some(created) = created else {
+        return "-".to_owned();
+    };
+
+    let secs = SystemTime::now()
+        .duration_since(created)
+        .map_or(0, |d| d.as_secs());
+
+    match secs {
+        s if s < 60 => "<1m".to_owned(),
+        s if s < 3_600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3_600),
+        s if s < 604_800 => format!("{}d", s / 86_400),
+        s if s < 2_592_000 => format!("{}w", s / 604_800),
+        s if s < 31_536_000 => format!("{}mo", s / 2_592_000),
+        s => format!("{}y", s / 31_536_000),
+    }
+}
+
+/// Falls back to mtime on filesystems that don't record a birth time.
+fn created_at(path: &Path) -> Option<SystemTime> {
+    let meta = std::fs::metadata(path).ok()?;
+    meta.created().or_else(|_| meta.modified()).ok()
+}
+
 /// Context for all git operations, anchored to a repo root.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GitContext {
     pub repo_root: PathBuf,
     pub worktrees_dir: PathBuf,
@@ -65,20 +191,31 @@ impl GitContext {
     }
 
     /// List all worktrees via `git worktree list --porcelain`.
-    pub fn list_worktrees(&self) -> Result<Vec<Worktree>> {
-        // Prune stale worktrees first
-        let _ = run_git(&["worktree", "prune"], Some(&self.repo_root));
+    /// When `prune` is true, runs `git worktree prune` first to clean stale entries.
+    pub fn list_worktrees_ex(&self, prune: bool) -> Result<Vec<Worktree>> {
+        if prune {
+            let _ = run_git(&["worktree", "prune"], Some(&self.repo_root));
+        }
 
         let output = run_git(
             &["worktree", "list", "--porcelain"],
             Some(&self.repo_root),
         )?;
-        Ok(parse_porcelain(&output, &self.repo_root))
+        let mut worktrees = parse_porcelain(&output, &self.repo_root);
+        for wt in &mut worktrees {
+            wt.created = created_at(&wt.path);
+        }
+        Ok(worktrees)
+    }
+
+    /// List all worktrees (with prune). Convenience wrapper for backward compat.
+    pub fn list_worktrees(&self) -> Result<Vec<Worktree>> {
+        self.list_worktrees_ex(true)
     }
 
     /// Find a worktree by branch name or directory name.
     pub fn find_worktree(&self, name: &str) -> Result<Worktree> {
-        let worktrees = self.list_worktrees()?;
+        let worktrees = self.list_worktrees_ex(false)?;
         worktrees
             .into_iter()
             .find(|wt| {
@@ -146,19 +283,23 @@ impl GitContext {
         Ok(worktree_path)
     }
 
-    /// Remove a worktree.
+    /// Remove a worktree by name (looks it up first).
     pub fn remove_worktree(&self, name: &str, force: bool) -> Result<()> {
         let wt = self.find_worktree(name)?;
+        self.remove_worktree_at(&wt, force)
+    }
 
+    /// Remove a worktree by reference, skipping the name-based lookup.
+    pub fn remove_worktree_at(&self, wt: &Worktree, force: bool) -> Result<()> {
         if wt.is_main {
             anyhow::bail!("Cannot remove the main worktree");
         }
 
+        let path_str = wt.path.to_string_lossy();
         let mut args = vec!["worktree", "remove"];
         if force {
             args.push("--force");
         }
-        let path_str = wt.path.to_string_lossy().to_string();
         args.push(&path_str);
 
         run_git(&args, Some(&self.repo_root))?;
@@ -171,14 +312,19 @@ impl GitContext {
         Ok(())
     }
 
-    /// Check if a worktree has uncommitted changes.
+    /// Check if a worktree has uncommitted changes using libgit2.
     #[allow(clippy::unused_self)]
     pub fn is_worktree_dirty(&self, path: &Path) -> Result<bool> {
-        let output = run_git(
-            &["status", "--porcelain"],
-            Some(path),
-        )?;
-        Ok(!output.trim().is_empty())
+        let repo = Repository::open(path)
+            .context("Failed to open repository")?;
+
+        let mut opts = git2::StatusOptions::new();
+        opts.include_untracked(true)
+            .recurse_untracked_dirs(false)
+            .exclude_submodules(true);
+
+        let statuses = repo.statuses(Some(&mut opts))?;
+        Ok(!statuses.is_empty())
     }
 
     /// Get the current branch name.
@@ -200,35 +346,78 @@ impl GitContext {
         Ok(PathBuf::from(output.trim()))
     }
 
-    /// Get ahead/behind counts relative to upstream.
+    /// Get ahead/behind counts relative to upstream using libgit2.
+    /// If `branch_name` is provided, skips detecting the branch from HEAD.
     #[allow(clippy::unused_self)]
-    pub fn ahead_behind(&self, path: &Path) -> Result<(u32, u32)> {
-        let branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"], Some(path))?;
-        let branch = branch.trim();
+    pub fn ahead_behind(&self, path: &Path, branch_name: Option<&str>) -> (u32, u32) {
+        let Ok(repo) = Repository::open(path) else {
+            return (0, 0);
+        };
 
-        let upstream = format!("origin/{branch}");
-        let result = run_git(
-            &[
-                "rev-list",
-                "--left-right",
-                "--count",
-                &format!("{branch}...{upstream}"),
-            ],
-            Some(path),
-        );
-
-        match result {
-            Ok(output) => {
-                let parts: Vec<&str> = output.trim().split('\t').collect();
-                if parts.len() == 2 {
-                    let ahead = parts[0].parse().unwrap_or(0);
-                    let behind = parts[1].parse().unwrap_or(0);
-                    Ok((ahead, behind))
-                } else {
-                    Ok((0, 0))
-                }
+        let branch = if let Some(name) = branch_name {
+            name.to_owned()
+        } else {
+            match repo.head() {
+                Ok(head) => head.shorthand().unwrap_or("HEAD").to_owned(),
+                Err(_) => return (0, 0),
             }
-            Err(_) => Ok((0, 0)), // No upstream tracking
+        };
+
+        let local_ref = format!("refs/heads/{branch}");
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+
+        let Ok(local_oid) = repo.refname_to_id(&local_ref) else {
+            return (0, 0);
+        };
+        let Ok(remote_oid) = repo.refname_to_id(&remote_ref) else {
+            return (0, 0);
+        };
+
+        repo.graph_ahead_behind(local_oid, remote_oid)
+            .map(|(a, b)| (u32::try_from(a).unwrap_or(0), u32::try_from(b).unwrap_or(0)))
+            .unwrap_or((0, 0))
+    }
+
+    /// List local branch names (sorted).
+    pub fn list_local_branches(&self) -> Vec<String> {
+        let output = run_git(
+            &["branch", "--format=%(refname:short)"],
+            Some(&self.repo_root),
+        );
+        match output {
+            Ok(s) => {
+                let mut branches: Vec<String> = s
+                    .lines()
+                    .map(|l| l.trim().to_owned())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                branches.sort();
+                branches
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// List all branches (local + remote), stripping `origin/` prefix, deduplicated and sorted.
+    pub fn list_all_branches(&self) -> Vec<String> {
+        let output = run_git(
+            &["branch", "-a", "--format=%(refname:short)"],
+            Some(&self.repo_root),
+        );
+        match output {
+            Ok(s) => {
+                let mut seen = std::collections::BTreeSet::new();
+                for line in s.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.contains("HEAD") {
+                        continue;
+                    }
+                    let name = trimmed.strip_prefix("origin/").unwrap_or(trimmed);
+                    seen.insert(name.to_owned());
+                }
+                seen.into_iter().collect()
+            }
+            Err(_) => Vec::new(),
         }
     }
 
@@ -363,6 +552,7 @@ fn parse_porcelain(output: &str, repo_root: &Path) -> Vec<Worktree> {
                     branch: current_branch.take(),
                     is_bare,
                     is_main,
+                    created: None,
                 });
                 is_bare = false;
             }
@@ -391,6 +581,7 @@ fn parse_porcelain(output: &str, repo_root: &Path) -> Vec<Worktree> {
             branch: current_branch,
             is_bare,
             is_main,
+            created: None,
         });
     }
 
@@ -401,7 +592,24 @@ fn parse_porcelain(output: &str, repo_root: &Path) -> Vec<Worktree> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    fn fixture(name: &str, created: Option<SystemTime>, is_main: bool) -> Worktree {
+        Worktree {
+            path: PathBuf::from(format!("/repo/.worktrees/{name}")),
+            head: "abc1234".to_owned(),
+            branch: Some(name.to_owned()),
+            is_bare: false,
+            is_main,
+            created,
+        }
+    }
+
+    fn names(worktrees: &[Worktree]) -> Vec<String> {
+        worktrees.iter().map(Worktree::display_name).collect()
+    }
 
     #[test]
     fn sanitize_replaces_slashes() {
@@ -448,6 +656,7 @@ branch refs/heads/feature/login
             branch: Some("feat/auth".to_owned()),
             is_bare: false,
             is_main: false,
+            created: None,
         };
         assert_eq!(wt.display_name(), "feat/auth");
     }
@@ -460,7 +669,64 @@ branch refs/heads/feature/login
             branch: None,
             is_bare: false,
             is_main: false,
+            created: None,
         };
         assert_eq!(wt.display_name(), "detached-head");
+    }
+
+    #[test]
+    fn sort_pins_main_and_orders_by_date() {
+        let now = SystemTime::now();
+        let tie = now - Duration::from_secs(300);
+        let mut worktrees = vec![
+            fixture("old", Some(now - Duration::from_secs(600)), false),
+            fixture("unknown", None, false),
+            fixture("bravo", Some(tie), false),
+            fixture("new", Some(now), false),
+            fixture("alpha", Some(tie), false),
+            fixture("main", Some(now - Duration::from_secs(9_999)), true),
+        ];
+
+        sort_worktrees(&mut worktrees, SortMode::DateDesc);
+        assert_eq!(
+            names(&worktrees),
+            ["main", "new", "alpha", "bravo", "old", "unknown"]
+        );
+
+        sort_worktrees(&mut worktrees, SortMode::DateAsc);
+        assert_eq!(
+            names(&worktrees),
+            ["main", "old", "alpha", "bravo", "new", "unknown"]
+        );
+    }
+
+    #[test]
+    fn sort_by_name_is_case_insensitive() {
+        let mut worktrees = vec![
+            fixture("Hotfix/log", None, false),
+            fixture("chore/deps", None, false),
+            fixture("feat/checkout", None, false),
+        ];
+
+        sort_worktrees(&mut worktrees, SortMode::NameAsc);
+        assert_eq!(names(&worktrees), ["chore/deps", "feat/checkout", "Hotfix/log"]);
+
+        sort_worktrees(&mut worktrees, SortMode::NameDesc);
+        assert_eq!(names(&worktrees), ["Hotfix/log", "feat/checkout", "chore/deps"]);
+    }
+
+    #[test]
+    fn format_age_bucket_boundaries() {
+        let now = SystemTime::now();
+        let age = |secs| format_age(Some(now - Duration::from_secs(secs)));
+
+        assert_eq!(age(59), "<1m");
+        assert_eq!(age(60), "1m");
+        assert_eq!(age(3_600), "1h");
+        assert_eq!(age(86_400), "1d");
+        assert_eq!(age(604_800), "1w");
+        assert_eq!(age(2_592_000), "1mo");
+        assert_eq!(age(31_536_000), "1y");
+        assert_eq!(format_age(None), "-");
     }
 }

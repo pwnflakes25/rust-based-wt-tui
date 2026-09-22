@@ -5,32 +5,35 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use super::{App, AppMode};
+use crate::git::format_age;
 
 pub fn render(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // header
-            Constraint::Min(5),    // body
-            Constraint::Length(3), // env/info bar
+            Constraint::Length(3), // header
+            Constraint::Min(5),   // body
             Constraint::Length(3), // footer
         ])
         .split(f.area());
 
     render_header(f, chunks[0], app);
     render_body(f, chunks[1], app);
-    render_env_bar(f, chunks[2], app);
-    render_footer(f, chunks[3], app);
+    render_footer(f, chunks[2], app);
 }
 
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let mode_str = match &app.mode {
         AppMode::Normal => "",
         AppMode::ConfirmDelete => " [CONFIRM DELETE]",
-        AppMode::ConfirmForceDelete => " [FORCE DELETE]",
-        AppMode::NewInput(_) => " [NEW WORKTREE]",
+        AppMode::NewInput(_) | AppMode::NewBaseInput { .. } => " [NEW WORKTREE]",
         AppMode::PrInput(_) => " [PR INPUT]",
     };
+
+    let sort_str = format!("sort: {} ", app.sort_mode.label());
+    let left_width = " wt dashboard".chars().count() + mode_str.chars().count();
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let gap = inner_width.saturating_sub(left_width + sort_str.chars().count());
 
     let title = Line::from(vec![
         Span::styled(
@@ -40,6 +43,8 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(mode_str, Style::default().fg(Color::Yellow)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(sort_str, Style::default().fg(Color::DarkGray)),
     ]);
 
     let header = Paragraph::new(title).block(
@@ -57,10 +62,35 @@ fn render_body(f: &mut Frame, area: Rect, app: &App) {
         .split(area);
 
     render_worktree_list(f, body_chunks[0], app);
-    render_worktree_info(f, body_chunks[1], app);
+
+    let show_autocomplete = matches!(
+        app.mode,
+        AppMode::NewInput(_) | AppMode::NewBaseInput { .. }
+    ) && app.autocomplete.is_some();
+
+    if show_autocomplete {
+        render_autocomplete(f, body_chunks[1], app);
+    } else {
+        render_worktree_info(f, body_chunks[1], app);
+    }
+}
+
+fn truncate_name(name: &str, max: usize) -> String {
+    if name.chars().count() <= max {
+        return name.to_owned();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out: String = name.chars().take(max - 1).collect();
+    out.push('\u{2026}');
+    out
 }
 
 fn render_worktree_list(f: &mut Frame, area: Rect, app: &App) {
+    const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
+    let inner_width = area.width.saturating_sub(2) as usize;
+
     let items: Vec<ListItem> = app
         .worktrees
         .iter()
@@ -68,15 +98,26 @@ fn render_worktree_list(f: &mut Frame, area: Rect, app: &App) {
         .map(|(i, wt)| {
             let is_current = app.current_path.as_ref() == Some(&wt.path);
             let is_selected = i == app.selected;
+            let is_deleting = app.deleting_paths.contains(&wt.path);
 
-            let marker = if is_current { " *" } else { "" };
-            let name = format!("{}{marker}", wt.display_name());
+            let age = format_age(wt.created);
+            let age_width = age.chars().count();
+            let spinner_width = if is_deleting { 2 } else { 0 };
+            let marker_width = if is_current { 2 } else { 0 };
+            let name = truncate_name(
+                &wt.display_name(),
+                inner_width.saturating_sub(spinner_width + marker_width + age_width + 1),
+            );
 
             let style = if is_selected {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
+            } else if is_deleting {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::DIM)
             } else if is_current {
                 Style::default()
                     .fg(Color::Green)
@@ -85,7 +126,28 @@ fn render_worktree_list(f: &mut Frame, area: Rect, app: &App) {
                 Style::default()
             };
 
-            ListItem::new(Span::styled(name, style))
+            let mut spans = if is_deleting {
+                let frame = SPINNER[app.spinner_frame % 4];
+                vec![
+                    Span::styled(
+                        format!("{frame} "),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(name.clone(), style),
+                ]
+            } else {
+                vec![Span::styled(name.clone(), style)]
+            };
+
+            if is_current {
+                spans.push(Span::styled(" *", style));
+            }
+
+            let used = spinner_width + name.chars().count() + marker_width;
+            let gap = inner_width.saturating_sub(used + age_width);
+            spans.push(Span::styled(format!("{}{age}", " ".repeat(gap)), style));
+
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -100,11 +162,8 @@ fn render_worktree_list(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_worktree_info(f: &mut Frame, area: Rect, app: &App) {
     let info = if let Some(wt) = app.selected_worktree() {
-        let dirty = app
-            .ctx
-            .is_worktree_dirty(&wt.path)
-            .unwrap_or(false);
-        let (ahead, behind) = app.ctx.ahead_behind(&wt.path).unwrap_or((0, 0));
+        let dirty = app.dirty_cache.get(&wt.path).copied().unwrap_or(false);
+        let (ahead, behind) = app.ahead_behind_cache.get(&wt.path).copied().unwrap_or((0, 0));
 
         let status_str = if dirty { "dirty" } else { "clean" };
         let status_color = if dirty { Color::Red } else { Color::Green };
@@ -153,6 +212,31 @@ fn render_worktree_info(f: &mut Frame, area: Rect, app: &App) {
             ]));
         }
 
+        // Env files section
+        if let Some(files) = app.env_files_cache.get(&wt.path) {
+            lines.push(Line::from("")); // blank separator
+            if files.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::raw("  Env:      "),
+                    Span::styled("No .env files", Style::default().fg(Color::DarkGray)),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::raw("  Env:      "),
+                    Span::styled(
+                        format!("{} file(s)", files.len()),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]));
+                for file in files {
+                    lines.push(Line::from(vec![
+                        Span::raw("            "),
+                        Span::styled(file.as_str(), Style::default().fg(Color::Green)),
+                    ]));
+                }
+            }
+        }
+
         lines
     } else {
         vec![Line::from("  No worktree selected")]
@@ -166,33 +250,49 @@ fn render_worktree_info(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(paragraph, area);
 }
 
-fn render_env_bar(f: &mut Frame, area: Rect, app: &App) {
-    let content = if let Some(wt) = app.selected_worktree() {
-        let files = crate::env::find_env_files(&wt.path, &app.config.env_patterns)
-            .unwrap_or_default();
-        if files.is_empty() {
-            "  No .env files".to_owned()
-        } else {
-            format!("  .env files: {}", files.join(", "))
-        }
-    } else {
-        String::new()
+fn render_autocomplete(f: &mut Frame, area: Rect, app: &App) {
+    let Some(ac) = &app.autocomplete else {
+        return;
     };
 
-    let bar = Paragraph::new(content).block(
+    let title = match &app.mode {
+        AppMode::NewInput(_) => " Branches ",
+        AppMode::NewBaseInput { .. } => " Base Branches ",
+        _ => " Suggestions ",
+    };
+
+    let items: Vec<ListItem> = ac
+        .filtered
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let style = if ac.selected == Some(i) {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Span::styled(format!("  {name}"), style))
+        })
+        .collect();
+
+    let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Env "),
+            .title(title),
     );
-    f.render_widget(bar, area);
+
+    f.render_widget(list, area);
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let msg = if let Some(msg) = &app.message {
-        Line::from(Span::styled(
-            format!("  {msg}"),
-            Style::default().fg(Color::Yellow),
-        ))
+        Line::from(vec![
+            Span::styled("  ", Style::default().fg(Color::Yellow)),
+            Span::styled(msg.as_str(), Style::default().fg(Color::Yellow)),
+        ])
     } else {
         match &app.mode {
             AppMode::Normal => Line::from(vec![
@@ -210,6 +310,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 Span::raw("r "),
                 Span::styled("[m]", Style::default().fg(Color::Cyan)),
                 Span::raw("erge "),
+                Span::styled("[o]", Style::default().fg(Color::Cyan)),
+                Span::raw("rder "),
                 Span::styled("[r]", Style::default().fg(Color::Cyan)),
                 Span::raw("efresh "),
                 Span::styled("[q]", Style::default().fg(Color::Cyan)),
@@ -225,20 +327,31 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 Span::styled("[n]", Style::default().fg(Color::Cyan)),
                 Span::raw("o"),
             ]),
-            AppMode::ConfirmForceDelete => Line::from(vec![
-                Span::styled(
-                    " Has local changes. Force delete? ",
-                    Style::default().fg(Color::Red),
-                ),
-                Span::styled("[y]", Style::default().fg(Color::Cyan)),
-                Span::raw("es "),
-                Span::styled("[n]", Style::default().fg(Color::Cyan)),
-                Span::raw("o"),
-            ]),
             AppMode::NewInput(s) => Line::from(vec![
                 Span::raw(" Branch: "),
                 Span::styled(s.as_str(), Style::default().fg(Color::Cyan)),
-                Span::raw("_ (Enter to create, Esc to cancel)"),
+                Span::raw("_ "),
+                Span::styled("Tab", Style::default().fg(Color::Cyan)),
+                Span::raw(":complete "),
+                Span::styled("↑↓", Style::default().fg(Color::Cyan)),
+                Span::raw(":navigate "),
+                Span::styled("Enter", Style::default().fg(Color::Cyan)),
+                Span::raw(":confirm "),
+                Span::styled("Esc", Style::default().fg(Color::Cyan)),
+                Span::raw(":cancel"),
+            ]),
+            AppMode::NewBaseInput { base, .. } => Line::from(vec![
+                Span::raw(" Base: "),
+                Span::styled(base.as_str(), Style::default().fg(Color::Cyan)),
+                Span::raw("_ "),
+                Span::styled("Tab", Style::default().fg(Color::Cyan)),
+                Span::raw(":complete "),
+                Span::styled("↑↓", Style::default().fg(Color::Cyan)),
+                Span::raw(":navigate "),
+                Span::styled("Enter", Style::default().fg(Color::Cyan)),
+                Span::raw(":create "),
+                Span::styled("Esc", Style::default().fg(Color::Cyan)),
+                Span::raw(":cancel"),
             ]),
             AppMode::PrInput(s) => Line::from(vec![
                 Span::raw(" PR #: "),
