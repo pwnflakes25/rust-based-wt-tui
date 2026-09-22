@@ -36,7 +36,7 @@ fn main() -> Result<()> {
 
 fn run_command(cmd: Command, ctx: &GitContext, config: &Config) -> Result<()> {
     match cmd {
-        Command::List => commands::list::run(ctx),
+        Command::List { sort, reverse } => commands::list::run(ctx, config, sort, reverse),
         Command::Status => commands::status::run(ctx, config),
         Command::New {
             branch,
@@ -44,9 +44,9 @@ fn run_command(cmd: Command, ctx: &GitContext, config: &Config) -> Result<()> {
             copy_env,
         } => commands::new::run(ctx, config, &branch, base.as_deref(), copy_env),
         Command::Remove { name, force } => {
-            commands::remove::run(ctx, name.as_deref(), force)
+            commands::remove::run(ctx, config, name.as_deref(), force)
         }
-        Command::Switch { name } => commands::switch::run(ctx, name.as_deref()),
+        Command::Switch { name } => commands::switch::run(ctx, config, name.as_deref()),
         Command::Env { source, target } => {
             commands::env_copy::run(ctx, config, &source, target.as_deref())
         }

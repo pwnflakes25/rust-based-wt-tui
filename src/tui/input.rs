@@ -88,6 +88,10 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             // Merge selected into current
             handle_merge(app);
         }
+        KeyCode::Char('o') => {
+            app.cycle_sort();
+            app.message = None;
+        }
         KeyCode::Char('r') => {
             match app.refresh() {
                 Ok(()) => app.message = Some("Refreshed.".to_owned()),
@@ -328,8 +332,9 @@ fn create_worktree(app: &mut App, branch: &str, base: &str) {
                         crate::env::copy_path_entries(current, &path, &app.config.copy_paths);
                 }
             }
-            app.message = Some(format!("Created worktree '{branch}'."));
             let _ = app.refresh_ex(false);
+            app.select_path(&path);
+            app.message = Some(format!("Created worktree '{branch}'."));
         }
         Err(e) => {
             app.message = Some(format!("Error: {e}"));

@@ -32,8 +32,8 @@ Two execution modes in `main.rs`:
 ### Module Map
 
 - `cli.rs` — Clap 4 derive-based argument parsing, defines `Command` enum
-- `config.rs` — Loads `~/.config/wt/config.toml` (env_patterns, auto_copy_env, default_base) with serde defaults
-- `git.rs` — Core module. `GitContext` discovers repo root, manages `.worktrees/` directory. `Worktree` struct parsed from `git worktree list --porcelain`. All git/gh subprocess calls go through `run_git()`/`run_gh()`
+- `config.rs` — Loads `~/.config/wt/config.toml` (env_patterns, auto_copy_env, default_base, copy_paths, default_sort) with serde defaults
+- `git.rs` — Core module. `GitContext` discovers repo root, manages `.worktrees/` directory. `Worktree` struct parsed from `git worktree list --porcelain`. All git/gh subprocess calls go through `run_git()`/`run_gh()`. Also owns display ordering: `SortMode` + `sort_worktrees()` (main pinned first, then creation date or name), and `format_age()`
 - `env.rs` — Recursive env file discovery with glob matching, skips noise dirs (node_modules, .git, target, etc.), preserves nested paths during copy
 - `commands/` — One file per subcommand (list, status, new, remove, switch, env_copy, pr, merge), each exports `run()`
 - `tui/mod.rs` — `App` struct holds state, `AppMode` enum (Normal, ConfirmDelete, ConfirmForceDelete, NewInput, PrInput)
@@ -44,7 +44,9 @@ Two execution modes in `main.rs`:
 
 - Shell integration: `wt switch` outputs ONLY the path to stdout; all messages go to stderr. This enables `cd "$(wt switch)"`.
 - Worktrees live in `<repo>/.worktrees/<sanitized-branch>/` — slashes in branch names become hyphens.
-- Main worktree is protected from deletion and risky operations.
+- Main worktree is protected from deletion and risky operations, and is pinned to the top of the list in every sort mode.
+- Sort precedence: `--sort`/`--reverse` flags > `o` in the dashboard (session only) > config `default_sort` > `date-desc`.
+- Worktree creation time comes from the checkout directory's filesystem birthtime (mtime fallback) — git records no such timestamp. Unknown times sort last in both date directions.
 - Error handling: `GitError` (thiserror) for git-specific errors, `anyhow::Result` everywhere else.
 - Clippy is strict: `all = deny`, `redundant_clone = deny`, `pedantic = warn`.
 

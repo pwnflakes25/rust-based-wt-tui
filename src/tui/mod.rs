@@ -17,7 +17,7 @@ use ratatui::Terminal;
 use ratatui::prelude::CrosstermBackend;
 
 use crate::config::Config;
-use crate::git::GitContext;
+use crate::git::{sort_worktrees, GitContext, SortMode};
 
 /// Autocomplete state for branch name suggestions.
 pub struct Autocomplete {
@@ -101,6 +101,7 @@ pub struct App {
     pub config: Config,
     pub worktrees: Vec<crate::git::Worktree>,
     pub selected: usize,
+    pub sort_mode: SortMode,
     pub mode: AppMode,
     pub current_path: Option<std::path::PathBuf>,
     pub message: Option<String>,
@@ -128,7 +129,9 @@ pub struct App {
 impl App {
     pub fn new(ctx: GitContext, config: Config) -> Result<Self> {
         // Prune on startup
-        let worktrees = ctx.list_worktrees_ex(true)?;
+        let sort_mode = config.sort_mode();
+        let mut worktrees = ctx.list_worktrees_ex(true)?;
+        sort_worktrees(&mut worktrees, sort_mode);
         let current_path = GitContext::current_worktree_path().ok();
         let (delete_tx, delete_rx) = mpsc::channel();
         let mut app = Self {
@@ -136,6 +139,7 @@ impl App {
             config,
             worktrees,
             selected: 0,
+            sort_mode,
             mode: AppMode::Normal,
             current_path,
             message: None,
@@ -157,13 +161,42 @@ impl App {
     /// Refresh worktree list and caches. Set `prune` to true for explicit refreshes
     /// (startup, user pressing 'r'), false after create/delete operations.
     pub fn refresh_ex(&mut self, prune: bool) -> Result<()> {
+        let previous = self.selected_worktree().map(|wt| wt.path.clone());
         self.worktrees = self.ctx.list_worktrees_ex(prune)?;
-        if self.selected >= self.worktrees.len() && !self.worktrees.is_empty() {
-            self.selected = self.worktrees.len() - 1;
-        }
+        sort_worktrees(&mut self.worktrees, self.sort_mode);
+        self.restore_selection(previous.as_deref());
         self.update_caches();
         self.message = None;
         Ok(())
+    }
+
+    /// Re-sort in place without re-reading git, keeping the highlight on the
+    /// same worktree while the rows move around it.
+    pub fn cycle_sort(&mut self) {
+        let previous = self.selected_worktree().map(|wt| wt.path.clone());
+        self.sort_mode = self.sort_mode.cycle();
+        sort_worktrees(&mut self.worktrees, self.sort_mode);
+        self.restore_selection(previous.as_deref());
+    }
+
+    pub fn select_path(&mut self, path: &std::path::Path) {
+        if let Some(index) = self.worktrees.iter().position(|wt| wt.path == path) {
+            self.selected = index;
+        }
+    }
+
+    /// Follow a worktree across a reorder. When it's gone (deleted), hold the
+    /// index so the row below slides into the highlight.
+    fn restore_selection(&mut self, previous: Option<&std::path::Path>) {
+        if let Some(path) = previous {
+            if let Some(index) = self.worktrees.iter().position(|wt| wt.path == path) {
+                self.selected = index;
+                return;
+            }
+        }
+        if self.selected >= self.worktrees.len() && !self.worktrees.is_empty() {
+            self.selected = self.worktrees.len() - 1;
+        }
     }
 
     /// Convenience: refresh with prune (for backward compat and explicit refresh).

@@ -1,14 +1,16 @@
 use anyhow::Result;
 use dialoguer::FuzzySelect;
 
-use crate::git::GitContext;
+use crate::config::Config;
+use crate::git::{sort_worktrees, GitContext};
 
-pub fn run(ctx: &GitContext, name: Option<&str>, force: bool) -> Result<()> {
+pub fn run(ctx: &GitContext, config: &Config, name: Option<&str>, force: bool) -> Result<()> {
     let target_name = if let Some(n) = name {
         n.to_owned()
     } else {
         // Interactive select
-        let worktrees = ctx.list_worktrees()?;
+        let mut worktrees = ctx.list_worktrees()?;
+        sort_worktrees(&mut worktrees, config.sort_mode());
         let removable: Vec<_> = worktrees
             .iter()
             .filter(|wt| !wt.is_main)

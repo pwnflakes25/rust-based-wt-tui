@@ -1,4 +1,6 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+use crate::git::SortMode;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -14,7 +16,15 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// List all worktrees (plain text table)
-    List,
+    List {
+        /// Sort key (defaults to `default_sort` from config)
+        #[arg(long, value_enum)]
+        sort: Option<SortKey>,
+
+        /// Reverse the sort direction
+        #[arg(long)]
+        reverse: bool,
+    },
 
     /// Show current worktree info
     Status,
@@ -80,4 +90,23 @@ pub enum Command {
 
     /// Print shell integration snippet
     Init,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+pub enum SortKey {
+    Date,
+    Name,
+}
+
+impl SortKey {
+    /// `--reverse` flips each key's natural direction: newest-first for date,
+    /// a-z for name.
+    pub fn to_mode(self, reverse: bool) -> SortMode {
+        match (self, reverse) {
+            (Self::Date, false) => SortMode::DateDesc,
+            (Self::Date, true) => SortMode::DateAsc,
+            (Self::Name, false) => SortMode::NameAsc,
+            (Self::Name, true) => SortMode::NameDesc,
+        }
+    }
 }

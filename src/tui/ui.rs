@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use super::{App, AppMode};
+use crate::git::format_age;
 
 pub fn render(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
@@ -29,6 +30,11 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         AppMode::PrInput(_) => " [PR INPUT]",
     };
 
+    let sort_str = format!("sort: {} ", app.sort_mode.label());
+    let left_width = " wt dashboard".chars().count() + mode_str.chars().count();
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let gap = inner_width.saturating_sub(left_width + sort_str.chars().count());
+
     let title = Line::from(vec![
         Span::styled(
             " wt dashboard",
@@ -37,6 +43,8 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(mode_str, Style::default().fg(Color::Yellow)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(sort_str, Style::default().fg(Color::DarkGray)),
     ]);
 
     let header = Paragraph::new(title).block(
@@ -67,8 +75,21 @@ fn render_body(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+fn truncate_name(name: &str, max: usize) -> String {
+    if name.chars().count() <= max {
+        return name.to_owned();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out: String = name.chars().take(max - 1).collect();
+    out.push('\u{2026}');
+    out
+}
+
 fn render_worktree_list(f: &mut Frame, area: Rect, app: &App) {
     const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
+    let inner_width = area.width.saturating_sub(2) as usize;
 
     let items: Vec<ListItem> = app
         .worktrees
@@ -78,6 +99,15 @@ fn render_worktree_list(f: &mut Frame, area: Rect, app: &App) {
             let is_current = app.current_path.as_ref() == Some(&wt.path);
             let is_selected = i == app.selected;
             let is_deleting = app.deleting_paths.contains(&wt.path);
+
+            let age = format_age(wt.created);
+            let age_width = age.chars().count();
+            let spinner_width = if is_deleting { 2 } else { 0 };
+            let marker_width = if is_current { 2 } else { 0 };
+            let name = truncate_name(
+                &wt.display_name(),
+                inner_width.saturating_sub(spinner_width + marker_width + age_width + 1),
+            );
 
             let style = if is_selected {
                 Style::default()
@@ -103,15 +133,19 @@ fn render_worktree_list(f: &mut Frame, area: Rect, app: &App) {
                         format!("{frame} "),
                         Style::default().fg(Color::Yellow),
                     ),
-                    Span::styled(wt.display_name(), style),
+                    Span::styled(name.clone(), style),
                 ]
             } else {
-                vec![Span::styled(wt.display_name(), style)]
+                vec![Span::styled(name.clone(), style)]
             };
 
             if is_current {
                 spans.push(Span::styled(" *", style));
             }
+
+            let used = spinner_width + name.chars().count() + marker_width;
+            let gap = inner_width.saturating_sub(used + age_width);
+            spans.push(Span::styled(format!("{}{age}", " ".repeat(gap)), style));
 
             ListItem::new(Line::from(spans))
         })
@@ -276,6 +310,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 Span::raw("r "),
                 Span::styled("[m]", Style::default().fg(Color::Cyan)),
                 Span::raw("erge "),
+                Span::styled("[o]", Style::default().fg(Color::Cyan)),
+                Span::raw("rder "),
                 Span::styled("[r]", Style::default().fg(Color::Cyan)),
                 Span::raw("efresh "),
                 Span::styled("[q]", Style::default().fg(Color::Cyan)),
